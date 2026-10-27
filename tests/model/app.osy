@@ -1,0 +1,88 @@
+
+
+using Osysharp.Identity;
+using Osysharp.ProblemReports;
+
+// AN OBSERVATORY'S LOGBOOK — the receiver. Its dome watcher reports; the kit knows neither: a problem is a key, a title and
+// its evidence.
+
+[Role] enum ObservatoryRole { Authenticator, Astronomer, Watcher }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+/// Somebody — or something — that signs in.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+policy IsAstronomer => RoleGrant.Any(g => g.Member == user && g.Role == ObservatoryRole.Astronomer);
+/// The receiving side's question: the watcher (another system, by its API key) reports problems, and nothing else.
+policy ReportsProblems => RoleGrant.Any(g => g.Member == user && g.Role == ObservatoryRole.Watcher);
+
+// ── the receiver: the logbook ───────────────────────────────────────────────────────────────────────────────────────
+
+/// One problem in the logbook — the last report of its key.
+entity LogbookEntry {
+  [Required, Unique, MaxLength(100)] string Key;
+  [Counter(EntryNumber)] int Number;
+  [Required, MaxLength(300)] string Title;
+  int Occurrences;
+  int Reports;
+  bool Open;
+  [MaxLength(500)] string Link = "";
+  security {
+    allow read when IsAstronomer || ReportsProblems;
+    allow create, update when ReportsProblems;
+  }
+}
+
+/// One step of an entry, kept once by the reporter's id for it.
+[Unique(Entry, SourceId)]
+entity LogbookStep {
+  [Required] LogbookEntry Entry;
+  [Required, MaxLength(100)] string SourceId;
+  [Required, MaxLength(40)] string Kind;
+  security {
+    allow read when IsAstronomer || ReportsProblems;
+    allow create when ReportsProblems;
+  }
+}
+
+Counter EntryNumber = new() { Start = 1 };
+
+/// What a report becomes here: one entry per key, made the first time and updated after; each step once.
+public class Logbook : IProblemReceiver {
+  public ProblemReportReceipt Receive(ProblemReport report) {
+    var key = report.Key;
+    var e = LogbookEntry.FirstOrDefault(x => x.Key == key);
+    var made = e == null;
+    if (made) { e = new LogbookEntry { Key = key, Title = report.Title }; }
+    var entry = e!;
+    entry.Title = report.Title;
+    entry.Occurrences = report.Occurrences;
+    entry.Open = report.Open;
+    entry.Link = report.Link;
+    entry.Reports = entry.Reports + 1;
+    var known = LogbookStep.Where(s => s.Entry == entry).Select(s => s.SourceId).ToList();
+    foreach (var s in report.Steps) {
+      if (s.Id == "" || known.Contains(s.Id)) { continue; }
+      new LogbookStep { Entry = entry, SourceId = s.Id, Kind = s.Kind };
+      known.Add(s.Id);
+    }
+    UnitOfWork.Commit();
+    return new ProblemReportReceipt { Reference = "#" + entry.Number, Created = made, Link = "https://observatory.test/logbook/" + entry.Number };
+  }
+}
+
+app.ProblemReports = new ProblemReportsSetup { Receiver = new Logbook() };
+
+app.Apis = [
+  new RestApi("Problems") {
+    Route = "problems",
+    Auth = new ApiAuth { ApiKey = true },
+    Endpoints = [ new Endpoint(ReceiveProblemReport) { Method = HttpMethod.Put, Path = "/{key}" } ],
+  },
+];

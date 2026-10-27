@@ -1,0 +1,63 @@
+// THE RECEIVING SIDE — a report arrives over the app's own REST route, as the principal its reporter signs in as, and the
+// receiver keeps one record per key. Only a principal `ReportsProblems` admits may report.
+using Osysharp.Identity;
+using Osysharp.ProblemReports;
+
+[TestFixture]
+void Observatory() {
+  var vera = new Person { Email = "vera@observatory.test", DisplayName = "Vera" };
+  new RoleGrant { Member = vera, Role = ObservatoryRole.Astronomer };
+  var watcher = new Person { Email = "watcher@observatory.test", DisplayName = "Dome watcher" };
+  new RoleGrant { Member = watcher, Role = ObservatoryRole.Watcher };
+}
+
+principal Vera => Person.Single(p => p.Email == "vera@observatory.test");
+principal Watcher => Person.Single(p => p.Email == "watcher@observatory.test");
+
+string Body(string key, int occurrences, string steps) =>
+  "{\"Report\":{\"Key\":\"" + key + "\",\"Kind\":\"DomeStuck\",\"Title\":\"The dome does not turn\",\"Severity\":\"Critical\","
+  + "\"Open\":true,\"Occurrences\":" + occurrences + ",\"FirstSeenAt\":\"2026-10-20T21:00:00Z\",\"LastSeenAt\":\"2026-10-20T22:00:00Z\","
+  + "\"Link\":\"https://watcher.test/dome\",\"Steps\":[" + steps + "]}}";
+string Opened() => "{\"Id\":\"s-1\",\"Kind\":\"Opened\",\"At\":\"2026-10-20T21:00:00Z\",\"Actor\":\"Platform\"}";
+string Recurred() => "{\"Id\":\"s-2\",\"Kind\":\"Recurred\",\"At\":\"2026-10-20T22:00:00Z\",\"Actor\":\"Platform\"}";
+
+[Test(Observatory)]
+void a_report_makes_one_record_and_a_repeat_updates_it() {
+  var key = Api.KeyFor(Watcher);
+  var first = Api.Put("/api/rest/v1/problems/dome-1", Body("dome-1", 1, Opened()), apiKey: key);
+  Assert.Equal(200, first.StatusCode);
+  var receipt = JsonSerializer.Deserialize<ProblemReportReceipt>(first.Body);
+  Assert.True(receipt.Created);
+  Assert.StartsWith("#", receipt.Reference);
+
+  var again = Api.Put("/api/rest/v1/problems/dome-1", Body("dome-1", 2, Opened() + "," + Recurred()), apiKey: key);
+  Assert.Equal(200, again.StatusCode);
+  Assert.False(JsonSerializer.Deserialize<ProblemReportReceipt>(again.Body).Created);
+  // The same report sent twice — a retry after a lost answer — adds no step twice.
+  Api.Put("/api/rest/v1/problems/dome-1", Body("dome-1", 2, Opened() + "," + Recurred()), apiKey: key);
+
+  runas (Vera) {
+    Assert.Equal(1, LogbookEntry.Count());
+    var e = LogbookEntry.Single(x => x.Key == "dome-1");
+    Assert.Equal(2, e.Occurrences);
+    Assert.Equal(3, e.Reports);
+    Assert.Equal("https://watcher.test/dome", e.Link);
+    Assert.Equal(2, LogbookStep.Count(s => s.Entry == e));
+  }
+}
+
+[Test(Observatory)]
+void only_a_principal_the_receiver_admits_may_report() {
+  Assert.Equal(401, Api.Put("/api/rest/v1/problems/dome-1", Body("dome-1", 1, Opened())).StatusCode);
+  Assert.Equal(403, Api.Put("/api/rest/v1/problems/dome-1", Body("dome-1", 1, Opened()), apiKey: Api.KeyFor(Vera)).StatusCode);
+  runas (Vera) { Assert.Equal(0, LogbookEntry.Count()); }
+}
+
+[Test(Observatory)]
+void a_report_without_its_title_or_under_another_key_is_refused() {
+  runas (Watcher) {
+    Assert.Throws<ValidationException>(() => ReceiveProblemReport("dome-1", new ProblemReport { Key = "dome-1", Title = " " }));
+    Assert.Throws<ValidationException>(() => ReceiveProblemReport("dome-1", new ProblemReport { Key = "dome-2", Title = "The dome" }));
+    Assert.Throws<ValidationException>(() => ReceiveProblemReport(" ", new ProblemReport { Title = "The dome" }));
+  }
+}

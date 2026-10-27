@@ -1,0 +1,55 @@
+namespace Osysharp.ProblemReports;
+
+using Osysharp.Identity;
+
+// THE RECEIVING SIDE — an app that takes problem reports from another.
+//
+// The app says three things:
+//     policy ReportsProblems => RoleGrant.Any(g => g.Member == user && g.Role == AppRole.Reporter);   // who may report
+//     app.ProblemReports = new ProblemReportsSetup { Receiver = new DeskProblems() };                 // what a report becomes
+//     new RestApi("Problems") { Route = "problems", Auth = new ApiAuth { ApiKey = true },
+//       Endpoints = [new Endpoint(ReceiveProblemReport) { Method = HttpMethod.Put, Path = "/{key}" }] }
+//
+// ⚑ WHO REPORTS IS THE RECEIVER'S DATA, NOT ITS SOURCE. The reporter calls as a principal the receiver's admin made
+//   (an integration with an API key) and granted the role `ReportsProblems` names. Which system that is, and its key,
+//   live on the receiver's environment — nothing in either app's source names the other.
+// ⚑ ONE KEY, ONE RECORD. `ReceiveProblemReport` checks the key and the title and hands the report to the receiver;
+//   making the record the first time and updating it after is the receiver's promise, and the kit's tests hold an
+//   example receiver to it.
+
+/// Who may report problems to this app — nobody, until the app says.
+virtual policy ReportsProblems => false;
+
+/// What a received report becomes. Implemented by the receiving app; it runs as the caller, inside the request, after
+/// the kit has checked the key and the title.
+public interface IProblemReceiver {
+  /// Keep `report` — make its record the first time its key is reported, update it every time after — and answer
+  /// where it is. A report seen before (the same key, the same steps) must change nothing twice.
+  ProblemReportReceipt Receive(ProblemReport report);
+}
+
+/// `app.ProblemReports = new ProblemReportsSetup { Receiver = … };` — what a received report becomes. (The reporting side
+/// is `app.ProblemReporting`, in Osysharp.ProblemReports.Sending.)
+[AppSetting("ProblemReports")]
+public class ProblemReportsSetup {
+  /// What a received report becomes. Null: this app takes no reports, and `ReceiveProblemReport` refuses each one.
+  public IProblemReceiver? Receiver;
+}
+
+/// Whether this app takes problem reports — its `Receiver` is set.
+public bool ReceivesProblemReports() { return App.Setting<ProblemReportsSetup>().Receiver != null; }
+
+/// PUT /{key} — a reporter reports the problem `key` as it now is. Route it on the app's REST API.
+[Authorize(ReportsProblems)]
+public ProblemReportReceipt ReceiveProblemReport(string key, ProblemReport report) {
+  var receiver = App.Setting<ProblemReportsSetup>().Receiver;
+  if (receiver == null) {
+    throw new NotFoundException("This app takes no problem reports: it names no receiver (`app.ProblemReports = new ProblemReportsSetup { Receiver = … }`).");
+  }
+  var k = key.Trim();
+  if (k == "" || k.Length > 100) { throw new ValidationException("Name the problem in the path: the reporter's own key for it, at most 100 characters."); }
+  if (report.Key != "" && report.Key.Trim() != k) { throw new ValidationException("The report's key is not the one in the path."); }
+  if (report.Title.Trim() == "") { throw new ValidationException("A problem report needs its title."); }
+  report.Key = k;
+  return receiver!.Receive(report);
+}

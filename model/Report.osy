@@ -1,0 +1,103 @@
+namespace Osysharp.ProblemReports;
+
+// THE WIRE — what a reporter sends and what a receiver answers. Both sides compile against these same classes, so a member
+// renamed here is renamed on both: a body binds by name, and two hand-kept copies drift apart silently.
+//
+// ⚠ A member removed or renamed here breaks every reporter and receiver that is not rebuilt at once — a MAJOR version.
+//   A member added is a minor one: an older receiver ignores it, and an older reporter leaves it at its default.
+
+/// One problem as its reporter now sees it — sent WHOLE each time it moves, so the last report a receiver took is the
+/// problem as it is. Every member but `Key` and `Title` may be left at its default.
+public class ProblemReport {
+  /// The reporter's own id for the problem, at most 100 characters. One key is one problem on the receiver.
+  public string Key = "";
+  /// What kind of problem it is, in the reporter's words — "GaugeSaturated", "JobFailed".
+  public string Kind = "";
+  /// Its headline. Required.
+  public string Title = "";
+  /// How bad: "Critical", "Warning", "Info" — or "" for not said.
+  public string Severity = "";
+  /// Where it is in the reporter's own flow — "Reported", "Triaged", "Fixed", "Released", "Verified gone", "Regressed".
+  public string Stage = "";
+  /// Whether it is happening now (an alert of it is open).
+  public bool Open;
+
+  /// Where it happens: a zone or region, an application, a workflow — each null when it does not apply.
+  public string? Zone;
+  public string? Application;
+  public string? Workflow;
+  /// What makes two occurrences the same problem — an exception and the frame it was raised at, say.
+  public string? Signature;
+
+  /// How often, and when first and last.
+  public DateTime FirstSeenAt;
+  public DateTime LastSeenAt;
+  public int Occurrences;
+
+  /// The evidence of its latest occurrence.
+  public string? Message;
+  public string? CorrelationId;
+  public string? ExceptionType;
+  /// The frame of the reporter's own code it was raised at.
+  public string? Frame;
+  /// The Osy# lines it was raised at, when the reporter runs Osy#.
+  public string? SourceLine;
+  /// Where its logs are.
+  public string? LogsLink;
+  /// Where the reporter shows it — the link back.
+  public string Link = "";
+
+  /// The reporter's steps, as its record now says them.
+  public DateTime? TriagedAt;
+  /// The triage verdict — "Defect", "Config", "Noise", "Duplicate".
+  public string? Verdict;
+  public string? TriagedBy;
+  /// Whether a person or an agent triaged it — the reporter's word.
+  public string? TriagedByActor;
+  public string? TriageNote;
+  public DateTime? FixCommittedAt;
+  public string? FixCommit;
+  public string? FixedBy;
+  public string? FixNote;
+  /// The release the fix shipped in.
+  public string? FixRelease;
+  public DateTime? ReleasedAt;
+  /// When the reporter saw it quiet long enough after its fix to call it gone.
+  public DateTime? VerifiedGoneAt;
+  /// How many times it came back after a fix, the last time, and on which release.
+  public int Regressions;
+  public DateTime? RegressedAt;
+  public string? RegressedOnRelease;
+
+  /// Every step the reporter recorded, oldest first. A receiver keeps each once, by its `Id`.
+  public List<ProblemReportStep> Steps = [];
+}
+
+/// One step of a problem, as its reporter recorded it.
+public class ProblemReportStep {
+  /// The reporter's id for the step — a report that carries it again adds nothing.
+  public string Id = "";
+  /// "Opened", "Recurred", "Triaged", "FixCommitted", "Released", "VerifiedGone", "Regressed" — the reporter's word.
+  public string Kind = "";
+  public DateTime At;
+  /// Who took it, in kind: "Person", "Agent", "Platform".
+  public string Actor = "";
+  /// Who took it, by name.
+  public string? By;
+  public string? Detail;
+}
+
+/// What a receiver answers a report with.
+public class ProblemReportReceipt {
+  /// The receiver's own name for the record the problem is on — a ticket number, an issue id.
+  public string Reference = "";
+  /// Whether this report made the record (the first report of its key).
+  public bool Created;
+  /// Where the receiver shows it.
+  public string Link = "";
+}
+
+/// The request body: the receiving endpoint takes the report as its `report` parameter.
+public class ProblemReportBody {
+  public ProblemReport Report = new ProblemReport();
+}

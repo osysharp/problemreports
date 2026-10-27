@@ -1,0 +1,26 @@
+// Osysharp.ProblemReports — one app tells another about the problems it sees, and the other follows them to the end.
+//
+// A REPORTER (a system that watches something — its alerts, its failed jobs, its errors) names each problem by a key of
+// its own and sends it AS IT NOW IS each time it moves: its evidence, how often, and its steps (triaged, fixed,
+// released, verified gone, back again). A RECEIVER (a help desk, a bug tracker, an on-call board) keeps one record per
+// key, so a report sent twice — a retry after a lost answer — changes nothing twice. Either side can be any Osy# app;
+// one app can be both.
+//
+// ⚑ THE WIRE IS ONE REQUEST. `PUT <receiver>/{key}` with the body `{"Report": <ProblemReport>}`, the receiver's key
+//   for the reporter in `X-API-Key`, answered with a `ProblemReportReceipt`. A reporter written in any language can
+//   send it; a receiver in any language can take it.
+// ⚑ THE RECEIVER SAYS WHO MAY REPORT. `policy ReportsProblems => …;` admits the callers (usually an integration
+//   principal holding one role and nothing else), and the app routes `ReceiveProblemReport` on its REST API. What a
+//   report becomes — a ticket, an issue, a page — is the receiver's `IProblemReceiver`.
+// ⚑ TWO KITS, SO EACH SIDE ASKS ONLY FOR WHAT IT USES. This one is the wire and the receiving side: it reaches nobody and
+//   reads no secret. The reporting side is `Osysharp.ProblemReports.Sending` (kits/problem-reports-sending), which asks
+//   for the receiver's host and the secret `ProblemReceiverKey`: owed first, sent later from the reporter's own schedule,
+//   retried on a widening wait and never given up on, off until the receiver's address and key are set.
+package Osysharp.ProblemReports {
+  version     "0.1.0";
+  minPlatform "0.17.0";
+  summary     "problem reports between apps — the wire and the receiving side: a reporter sends each problem it sees, by its own key, as it now is (evidence, occurrences, its steps from triaged to verified gone), in one PUT with an API key, and the receiver keeps one record per key; the receiver decides who may report and what a report becomes. The reporting side is Osysharp.ProblemReports.Sending.";
+  model "model/**/*.osy";
+  use Osysharp.Identity@0;
+  tests "tests";
+}

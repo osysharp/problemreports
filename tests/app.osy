@@ -1,0 +1,9 @@
+// The producer's test project for Osysharp.ProblemReports — the receiving side: a small observatory's logbook, which keeps one
+// entry per problem its dome watcher (another system, by its API key) reports. The reporting side is tested in
+// kits/problem-reports-sending.
+app ProblemReportsKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Identity@0;
+  use Osysharp.ProblemReports@0;
+}
