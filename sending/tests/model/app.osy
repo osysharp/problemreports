@@ -1,0 +1,56 @@
+using Osysharp.Identity;
+using Osysharp.ProblemReports;
+using Osysharp.ProblemReports.Sending;
+
+// AN OBSERVATORY'S NIGHT JOBS — the reporter. The kit knows nothing of jobs: a problem is a key, a title and its evidence.
+
+[Role] enum ObservatoryRole { Authenticator, Operator }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+/// Somebody — or something — that signs in.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+policy IsOperator => RoleGrant.Any(g => g.Member == user && g.Role == ObservatoryRole.Operator);
+/// The operator queues and sends.
+policy SendsProblemReports => IsOperator;
+
+/// A night job that failed — how often, and the last thing it said.
+entity FailedJob {
+  [Required, Unique, MaxLength(100)] string Name;
+  int Failures;
+  [MaxLength(500)] string LastError = "";
+  bool Gone;
+  security { allow read, create, update when IsOperator; }
+}
+
+/// What a failing job's report says.
+public class JobProblems : IProblemSource {
+  public ProblemReport? ReportOf(string key) {
+    var job = FailedJob.FirstOrDefault(j => j.Name == key);
+    if (job == null || job!.Gone) { return null; }
+    return new ProblemReport { Key = key, Kind = "JobFailed", Title = "The night job " + key + " fails", Severity = "Warning",
+      Open = true, Occurrences = job!.Failures, Message = job!.LastError, Link = "https://observatory.test/jobs/" + key,
+      FirstSeenAt = DateTime.UtcNow, LastSeenAt = DateTime.UtcNow,
+      Steps = [new ProblemReportStep { Id = key + "-opened", Kind = "Opened", At = DateTime.UtcNow, Actor = "Platform" }] };
+  }
+}
+
+/// A job failed: counted, and its report owed — nothing here calls the logbook.
+public void JobFailed(string name, string error) {
+  var job = FailedJob.FirstOrDefault(j => j.Name == name) ?? new FailedJob { Name = name };
+  job.Failures = job.Failures + 1;
+  job.LastError = error;
+  ProblemReportOwed(name);
+  UnitOfWork.Commit();
+}
+
+app.Secrets = [ new Secret("ProblemReceiverKey") ];
+app.Config = [ new Setting("LogbookUrl") { Default = "https://observatory.test/api/rest/v1/problems" } ];
+
+app.ProblemReporting = new ProblemReportingSetup { Source = new JobProblems(), ReceiverUrl = Config.LogbookUrl };

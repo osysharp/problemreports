@@ -1,0 +1,221 @@
+namespace Osysharp.ProblemReports.Sending;
+
+using Osysharp.ProblemReports;
+using Osysharp.Identity;
+using Osysharp.Http;
+
+// THE REPORTING SIDE — an app that tells a receiver about its problems.
+//
+// The app says what a problem's report is, where the receiver is, and when to send:
+//     app.Config  = [new Setting("ProblemReceiverUrl") { Default = "" }];   // its value per environment
+//     app.Secrets = [new Secret("ProblemReceiverKey")];                       // the receiver's key for this app
+//     app.ProblemReporting = new ProblemReportingSetup { Source = new JobProblems(), ReceiverUrl = Config.ProblemReceiverUrl };
+//     use Osysharp.ProblemReports.Sending@0 { egress "*"; secret "ProblemReceiverKey"; }   // or the receiver's host
+//     policy SendsProblemReports => IsOperator;      // who queues and sends (its schedule runs as one of them)
+//     ProblemReportOwed(job.Id.ToString());          // wherever a problem moves
+//     SendOwedProblemReports();                      // from its own schedule
+//
+// ⚑ OWED FIRST, SENT LATER. Marking a problem owed is one row, inside the work that moved it; nothing there calls the
+//   receiver. `SendOwedProblemReports` asks the source for each owed problem's report AS IT NOW IS and puts it, so a
+//   problem that moved three times between two passes is sent once, and a report that overtakes another leaves the
+//   receiver right.
+// ⚑ NEVER GIVEN UP ON. A refusal, or no answer, is kept on the delivery in the receiver's own words and tried again on a
+//   widening wait. The first call in a pass that gets no answer (or a 5xx) ends the pass, and everything else due
+//   waits as long as it: a receiver that is down costs one call per wait, and the wait widens for the receiver.
+// ⚑ OFF UNTIL CONFIGURED. With no `ReceiverUrl` or no value for the secret `ProblemReceiverKey`, nothing is sent and
+//   nothing fails: what is owed is kept here, and goes once both are set.
+
+/// Who queues and sends this app's problem reports — nobody, until the app says.
+virtual policy SendsProblemReports => false;
+/// Who reads the delivery log — whoever sends, until the app says.
+virtual policy ReadsProblemReports => SendsProblemReports;
+
+/// `app.ProblemReporting = new ProblemReportingSetup { … };` — what a problem's report says and where the receiver is.
+[AppSetting("ProblemReporting")]
+public class ProblemReportingSetup {
+  /// What a problem's report says, asked when it is sent. Null: nothing is sent.
+  public IProblemSource? Source;
+  /// The receiver's problems route, `https://desk.example/api/rest/v1/problems` — the request goes to `<ReceiverUrl>/<key>`.
+  /// Give it the value of an environment setting (`Config.<Name>`), never a literal: which receiver an environment reports
+  /// to is deployment configuration. "" reports nowhere.
+  public string ReceiverUrl = "";
+  /// At most this many reports are sent in one pass.
+  public int PerPass = 20;
+  /// The wait after the first failed try; each wait after it doubles, never longer than `LongestWait`.
+  public TimeSpan FirstWait = TimeSpan.FromMinutes(1);
+  public TimeSpan LongestWait = TimeSpan.FromHours(1);
+}
+
+/// What a problem's report says. Implemented by the reporting app.
+public interface IProblemSource {
+  /// The problem `key` as it now is — or null when it is gone, and nothing is sent for it.
+  ProblemReport? ReportOf(string key);
+}
+
+/// Where the report of one problem is. ⚠ APPEND-ONLY: the ordinals are stored.
+public enum ProblemReportState {
+  /// The problem moved since the receiver last took its report.
+  [Label("Owed")] Owed,
+  [Label("Delivered")] Delivered
+}
+
+/// One problem's report to the receiver: whether one is owed, and what the receiver answered last.
+entity ProblemReportDelivery {
+  /// The reporter's key for the problem.
+  [Required, Unique, MaxLength(100)] string Key;
+  ProblemReportState State = ProblemReportState.Owed;
+  /// When the report became owed.
+  [Required] DateTime OwedSince;
+  /// Tries since it was last delivered, and when the next is due (null: now).
+  int Attempts = 0;
+  DateTime? NextAttemptAt;
+  DateTime? DeliveredAt;
+  /// How many reports of it the receiver took.
+  int Delivered = 0;
+  /// Where the receiver keeps it, as its last receipt said.
+  [MaxLength(200)] string? Reference;
+  [MaxLength(500)] string? Link;
+  /// What the receiver said the last time it refused, or why it could not be reached — clipped.
+  [MaxLength(2000)] string? LastFailure;
+  DateTime? LastFailedAt;
+
+  security {
+    allow read when ReadsProblemReports;
+    allow read, create, update, delete when SendsProblemReports;
+  }
+}
+
+string ClipReport(string? s, int n) { var v = s ?? ""; return v.Length > n ? v.Substring(0, n) : v; }
+
+/// The receiver's problems route as this environment sets it, without a trailing slash; "" when none is set.
+public string ProblemReceiverAddress() {
+  var root = App.Setting<ProblemReportingSetup>().ReceiverUrl.Trim();
+  return root.EndsWith("/") ? root.Substring(0, root.Length - 1) : root;
+}
+
+/// Whether reports are sent from here: the receiver's address and its key both have values.
+public bool ProblemReceiverConfigured() {
+  return ProblemReceiverAddress() != "" && Security.IsSecretSet("ProblemReceiverKey");
+}
+
+/// Mark the problem `key` as owed a report — call it wherever the problem moves. Idempotent: a problem already owed
+/// stays owed once.
+[Authorize(SendsProblemReports)]
+public void ProblemReportOwed(string key) {
+  var k = key.Trim();
+  if (k == "" || k.Length > 100) { throw new ValidationException("A problem's key is 1 to 100 characters."); }
+  var d = ProblemReportDelivery.FirstOrDefault(x => x.Key == k);
+  if (d == null) {
+    new ProblemReportDelivery { Key = k, State = ProblemReportState.Owed, OwedSince = DateTime.UtcNow };
+    return;
+  }
+  if (d!.State == ProblemReportState.Delivered) {
+    d!.State = ProblemReportState.Owed;
+    d!.OwedSince = DateTime.UtcNow;
+    d!.Attempts = 0;
+    d!.NextAttemptAt = null;
+  }
+}
+
+/// How long to wait after the Nth failed try: `FirstWait`, doubling, at most `LongestWait`.
+TimeSpan ProblemReportWait(int attempts) {
+  var setup = App.Setting<ProblemReportingSetup>();
+  var wait = setup.FirstWait;
+  for (var i = 1; i < attempts && wait < setup.LongestWait; i++) { wait = wait + wait; }
+  return wait > setup.LongestWait ? setup.LongestWait : wait;
+}
+
+/// Put one owed report. Answers false when the receiver could not be reached at all (no answer, or a 5xx).
+[SuppressWarning("reliability-outbound-call-unguarded")]
+bool AttemptProblemReport(ProblemReportDelivery d, IProblemSource source, DateTime now) {
+  var report = source.ReportOf(d.Key);
+  if (report == null) {
+    // Gone at the source: nothing to tell.
+    d.State = ProblemReportState.Delivered;
+    d.Attempts = 0;
+    d.NextAttemptAt = null;
+    return true;
+  }
+  d.Attempts = d.Attempts + 1;
+  report!.Key = d.Key;
+  var headers = new Dictionary<string, string>();
+  headers.Add("X-API-Key", Secret.ProblemReceiverKey);
+  string? failure = null;
+  var reached = true;
+  try {
+    var body = JsonSerializer.Serialize(new ProblemReportBody { Report = report! });
+    var response = Http.Put(ProblemReceiverAddress() + "/" + Uri.EscapeDataString(d.Key), body, "application/json", headers);
+    if (response.IsSuccess) {
+      var receipt = JsonSerializer.Deserialize<ProblemReportReceipt>(response.Body);
+      if (d.LastFailure != null) {
+        Log.Information("The problem receiver took the report of {Problem} again after: {Failure}", d.Key, d.LastFailure);
+      }
+      d.State = ProblemReportState.Delivered;
+      d.DeliveredAt = now;
+      d.Delivered = d.Delivered + 1;
+      d.Attempts = 0;
+      d.NextAttemptAt = null;
+      d.Reference = ClipReport(receipt.Reference, 200);
+      d.Link = ClipReport(receipt.Link, 500);
+      d.LastFailure = null;
+      return true;
+    }
+    failure = $"HTTP {response.StatusCode}: {ClipReport(response.Body, 1500)}";
+    reached = response.StatusCode < 500;
+  } catch (Exception e) {
+    // No answer — DNS, TLS, a timeout, or the egress guard.
+    failure = ClipReport(e.Message, 1500);
+    reached = false;
+  }
+  // Said once when a report starts failing, not on every retry.
+  if (d.Attempts == 1) {
+    Log.Warning("The problem receiver did not take the report of {Problem}: {Failure}. Trying again on a widening wait.", d.Key, failure);
+  }
+  d.LastFailure = ClipReport(failure, 2000);
+  d.LastFailedAt = now;
+  d.NextAttemptAt = now + ProblemReportWait(d.Attempts);
+  return reached;
+}
+
+/// Send what is owed and due, oldest first, at most `PerPass` — call it from the reporter's own schedule. Never throws
+/// for a receiver that refuses or is down. Answers how many reports the receiver took; 0, sending nothing, while the
+/// receiver is not configured or no `Source` is set.
+[Authorize(SendsProblemReports)]
+public int SendOwedProblemReports() {
+  var setup = App.Setting<ProblemReportingSetup>();
+  if (setup.Source == null || !ProblemReceiverConfigured()) { return 0; }
+  var now = DateTime.UtcNow;
+  var due = ProblemReportDelivery
+    .Where(d => d.State == ProblemReportState.Owed && (d.NextAttemptAt == null || d.NextAttemptAt <= now))
+    .OrderBy(d => d.OwedSince).Take(setup.PerPass).ToList();
+  var took = 0;
+  foreach (var d in due) {
+    var before = d.Delivered;
+    var reached = AttemptProblemReport(d, setup.Source!, now);
+    if (d.Delivered > before) { took = took + 1; }
+    if (!reached) {
+      // The receiver is down: everything owed waits as long as the call that got no answer, so the next pass tries
+      // the oldest again and the wait widens for the receiver, not per problem.
+      var until = d.NextAttemptAt;
+      var waiting = ProblemReportDelivery
+        .Where(x => x.State == ProblemReportState.Owed && x.Key != d.Key && (x.NextAttemptAt == null || x.NextAttemptAt < until))
+        .ToList();
+      foreach (var x in waiting) { x.NextAttemptAt = until; }
+      break;
+    }
+  }
+  return took;
+}
+
+/// What a problem's report is, in a line for the reporter's own page: where the receiver keeps it, or what is owed and
+/// why. "" when it was never owed.
+public string ProblemReportLine(string key) {
+  var d = ProblemReportDelivery.FirstOrDefault(x => x.Key == key);
+  if (d == null) { return ""; }
+  var where = d!.Reference == null || d!.Reference == "" ? "" : " " + d!.Reference;
+  if (d!.State == ProblemReportState.Delivered) { return "Reported" + (where == "" ? "." : ":" + where + "."); }
+  if (!ProblemReceiverConfigured()) { return "Owed: no problem receiver is configured here, so it is kept until one is."; }
+  return d!.LastFailure == null
+    ? "Owed" + (where == "" ? "" : " (" + where.Trim() + ")") + ": it goes with the next pass."
+    : $"Owed{(where == "" ? "" : " (" + where.Trim() + ")")}, tried {d!.Attempts}×: {d!.LastFailure}";
+}

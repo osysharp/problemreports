@@ -1,0 +1,12 @@
+// The producer's test project for Osysharp.ProblemReports.Sending — a small observatory whose night jobs (exposures, focus
+// runs, dome checks) fail now and then; each failure is owed to the observatory's logbook and sent later. The logbook is
+// answered at the HTTP boundary by the tests' stub.
+app ProblemReportsSendingKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Identity@0;
+  use Osysharp.ProblemReports@0;
+  // The logbook's address is this environment's setting, so the host is the app's to grant.
+  use Osysharp.ProblemReports.Sending@0 { egress "*"; secret "ProblemReceiverKey"; }
+  use Osysharp.Http;
+}

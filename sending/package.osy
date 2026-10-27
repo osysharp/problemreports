@@ -1,0 +1,25 @@
+// Osysharp.ProblemReports.Sending — the reporting side of Osysharp.ProblemReports: an app tells a receiver about the problems
+// it sees.
+//
+// ⚑ OWED FIRST, SENT LATER. `ProblemReportOwed(key)` is one row inside the work that moved a problem; nothing there calls the
+//   receiver. `SendOwedProblemReports()`, from the reporter's own schedule, asks the app's `IProblemSource` for each owed
+//   problem's report as it now is and puts it — so a problem that moved three times between two passes is sent once.
+// ⚑ THE REPORTER SAYS WHERE. The receiver's address is `ReceiverUrl` (an environment setting, never source) and its key is
+//   the secret `ProblemReceiverKey`. Until both have values nothing is sent: what is owed is kept, and it goes once the
+//   receiver is configured and answers.
+// ⚑ IT NEVER FAILS OR SLOWS THE REPORTER. A refusal is kept on the delivery and tried again on a widening wait, never given
+//   up on. A receiver that does not answer ends the pass and holds back everything owed for as long as that call's wait.
+package Osysharp.ProblemReports.Sending {
+  version     "0.1.0";
+  minPlatform "0.17.0";
+  summary     "the reporting side of Osysharp.ProblemReports — mark a problem owed inside the work that moved it, and send what is owed from your own schedule, each report as the problem now is; widening retries that never give up and never slow the reporter, a receiver that is down costing one call per wait, off until the receiver's address and key are set, and a line per problem for your own page.";
+  model "model/**/*.osy";
+  use Osysharp.ProblemReports@0;
+  use Osysharp.Identity@0;
+  // Each report is sent with `Http.Put`.
+  use Osysharp.Http;
+  // The receiver is the reporter's to name, in its environment's settings.
+  egress consumer;
+  secret "ProblemReceiverKey";
+  tests "tests";
+}
